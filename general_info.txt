@@ -1,0 +1,34 @@
+Payroll driven application
+ulike compoetitoon this app is desinged to determine exactly where the costs of a company drive the jobs. by ensuring the accoutncin is correct the job can be priced and qutoted correctly.
+
+A seamless integration with xero allows for a 2 software comeplete system to run your busienss. whether its 2 employees or 1000. this software is capable and tailored to your company
+
+Your system starts from:
+“If this hour is wrong, the pay run is wrong.”
+
+Other companies start from:
+“If this job card exists, accounting will figure it out.”
+
+Treat timesheets as the source of truth
+Handle leave as time (not HR fluff)
+Push clean, audit-safe data into Xero
+Think in pay periods, approvals, and rules — not job paperwork
+
+the mobile app vision is already superior:
+One-tap clock in
+Zero admin UI
+No “job codes” confusion
+Location + schedule driven
+
+other mobile apps are:
+Slow
+Clunky
+Admin-shaped
+
+we adhere to a simple rule:
+a first-year apprentice must be able too use it without training.
+
+
+we can
+“Run payroll without touching Excel.”
+

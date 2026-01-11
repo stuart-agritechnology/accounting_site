@@ -1,0 +1,17 @@
+{
+  "overtime": {
+    "ordinaryMinutesPerDay": 480,
+    "tiers": [
+      {
+        "label": "OT1.5",
+        "firstMinutes": 60,
+        "multiplier": 2
+      },
+      {
+        "label": "OT2.0",
+        "multiplier": 25,
+        "firstMinutes": 120
+      }
+    ]
+  }
+}

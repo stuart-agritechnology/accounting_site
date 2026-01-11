@@ -1,0 +1,1 @@
+// src/payroll/errors.ts
