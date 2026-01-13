@@ -99,7 +99,7 @@ export type EmployeeBaseRate = {
   employeeId: string;
   employeeName: string;
   baseRate: number; // $/hour
-  source: "employee_paytemplate" | "payitem_default";
+  source: "employee_paytemplate" | "payitem_default" | "salary_derived";
   earningsRateId?: string;
   earningsRateName?: string;
 };
@@ -171,6 +171,36 @@ export function deriveBaseRates(employees: XeroEmployee[], payItems: XeroPayItem
               earningsRateName: def?.name,
             },
             score: scoreEarningsRate(def?.name ?? "", def?.earningsType),
+          };
+        }
+      }
+    }
+
+
+    // ✅ Salary fallback: derive hourly rate from AnnualSalary + HoursPerWeek (common for salaried staff)
+    if (!best) {
+      const pt: any = (e as any).PayTemplate ?? (e as any).payTemplate ?? {};
+      const annual =
+        toNum(pt?.AnnualSalary ?? pt?.annualSalary ?? pt?.Salary ?? pt?.salary ?? pt?.SalaryAmount ?? pt?.salaryAmount) ??
+        toNum(pt?.SalaryAndWages?.AnnualSalary ?? pt?.salaryAndWages?.annualSalary) ??
+        toNum((e as any).AnnualSalary ?? (e as any).annualSalary);
+
+      const hoursPerWeek =
+        toNum(pt?.HoursPerWeek ?? pt?.hoursPerWeek ?? pt?.StandardHoursPerWeek ?? pt?.standardHoursPerWeek) ??
+        toNum(pt?.SalaryAndWages?.HoursPerWeek ?? pt?.salaryAndWages?.hoursPerWeek) ??
+        toNum((e as any).HoursPerWeek ?? (e as any).hoursPerWeek);
+
+      if (annual && annual > 0 && hoursPerWeek && hoursPerWeek > 0) {
+        const hourly = annual / (hoursPerWeek * 52);
+        if (hourly > 0) {
+          best = {
+            cand: {
+              employeeId,
+              employeeName: name,
+              baseRate: hourly,
+              source: "salary_derived",
+            },
+            score: 0,
           };
         }
       }

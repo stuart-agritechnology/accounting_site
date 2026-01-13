@@ -13,7 +13,7 @@ function csvEscape(v: unknown): string {
 }
 
 function toCsv(rows: Array<Record<string, string | number>>): string {
-  const headers = ["employee", "job", "day", "start", "end", "hours", "type", "baseRate"];
+  const headers = ["employee", "xeroEmployeeId", "job", "day", "start", "end", "hours", "type", "baseRate"];
   const lines: string[] = [];
   lines.push(headers.join(","));
   for (const r of rows) {
@@ -72,7 +72,7 @@ function normalizeDurationToHours(raw: number | null): number | null {
   return raw;
 }
 
-async function getXeroOrdinaryRateMap(): Promise<Map<string, number>> {
+async function getXeroOrdinaryRateMap(): Promise<Map<string, { baseRate: number; employeeId: string }>> {
   try {
     const empJson = await xeroFetch("https://api.xero.com/payroll.xro/1.0/Employees");
     const rawEmployees = (empJson?.employees ?? empJson?.Employees ?? []) as any[];
@@ -131,11 +131,11 @@ async function getXeroOrdinaryRateMap(): Promise<Map<string, number>> {
       }
     }
 
-    const map = new Map<string, number>();
+    const map = new Map<string, { baseRate: number; employeeId: string }>();
     for (const br of baseRates) {
       const k = normFullName(br.employeeName);
       if (!k) continue;
-      if (!map.has(k)) map.set(k, br.baseRate);
+      if (!map.has(k)) map.set(k, { baseRate: br.baseRate, employeeId: String((br as any).employeeId ?? "").trim() });
     }
     return map;
   } catch {
@@ -264,7 +264,9 @@ export async function GET(req: Request) {
         .filter(Boolean);
 
       const k = normFullName(user);
-      const xeroRate = xeroRatesByName.get(k) ?? null;
+      const xeroHit = xeroRatesByName.get(k) ?? null;
+      const xeroRate = xeroHit?.baseRate ?? null;
+      const xeroEmployeeId = xeroHit?.employeeId ?? "";
 
       const fergusRate = toNum(t?.payRate ?? t?.PayRate);
 
@@ -272,6 +274,7 @@ export async function GET(req: Request) {
 
       return {
         employee: user,
+        xeroEmployeeId,
         job: jobBits.join(" ").trim(),
         day,
         start: start.time || "", // may be empty if Fergus doesn't return times

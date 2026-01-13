@@ -160,6 +160,66 @@ const selectStyle: React.CSSProperties = {
   appearance: "none",             // optional: makes selects consistent
 };
 
+const switchWrap: React.CSSProperties = {
+  width: 44,
+  height: 26,
+  borderRadius: 999,
+  border: "1px solid #2a2a2a",
+  padding: 3,
+  display: "inline-flex",
+  alignItems: "center",
+  cursor: "pointer",
+  userSelect: "none",
+  transition: "background 120ms ease, opacity 120ms ease",
+};
+
+const switchKnob: React.CSSProperties = {
+  width: 20,
+  height: 20,
+  borderRadius: 999,
+  background: "white",
+  transition: "transform 140ms ease",
+};
+
+function Switch({
+  checked,
+  onChange,
+  disabled,
+  label,
+}: {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  disabled?: boolean;
+  label?: string;
+}) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+      <button
+        type="button"
+        onClick={() => !disabled && onChange(!checked)}
+        disabled={disabled}
+        aria-pressed={checked}
+        aria-label={label ?? "Toggle"}
+        style={{
+          ...switchWrap,
+          background: checked ? "rgba(34,197,94,0.22)" : "transparent",
+          opacity: disabled ? 0.6 : 1,
+        }}
+      >
+        <div
+          style={{
+            ...switchKnob,
+            transform: checked ? "translateX(18px)" : "translateX(0px)",
+          }}
+        />
+      </button>
+
+      {label ? <div style={{ fontWeight: 700 }}>{label}</div> : null}
+    </div>
+  );
+}
+
+
 export default function RulesPage() {
   const { hasImported, applyRules, timeEntries } = usePayrollData();
 
@@ -542,57 +602,59 @@ export default function RulesPage() {
 
           {/* 3) Lunch break */}
           <div style={cardStyle}>
-            <div style={{ fontWeight: 800, marginBottom: 10 }}>3) Lunch break</div>
+            <Switch
+  checked={jobRules.lunch.paid}
+  onChange={(next) => updateCurrent({ lunch: { ...jobRules.lunch, paid: next } })}
+  label={jobRules.lunch.paid ? "Paid lunch break (ON)" : "Paid lunch break (OFF)"}
+/>
 
-            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-              <input
-                type="checkbox"
-                checked={jobRules.lunch.paid}
-                onChange={(e) => updateCurrent({ lunch: { ...jobRules.lunch, paid: e.target.checked } })}
-              />
-              <div style={{ fontWeight: 700 }}>Paid lunch break</div>
-            </div>
+{jobRules.lunch.paid ? (
+  <div
+    style={{
+      marginTop: 12,
+      paddingTop: 12,
+      borderTop: "1px solid #2a2a2a",
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
+      gap: 10,
+    }}
+  >
+    <div>
+      <div style={{ fontSize: 12, opacity: 0.85 }}>Lunch minutes</div>
+      <input
+        value={String(jobRules.lunch.minutes)}
+        onChange={(e) => {
+          const mins = Math.max(0, Math.round(safeNumber(e.target.value, jobRules.lunch.minutes)));
+          updateCurrent({ lunch: { ...jobRules.lunch, minutes: mins } });
+        }}
+        inputMode="numeric"
+        style={inputStyle}
+      />
+    </div>
 
-            {/* ✅ FIX: auto-fit so it never overlaps on narrower widths */}
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
-                gap: 10,
-                marginTop: 10,
-              }}
-            >
-              <div>
-                <div style={{ fontSize: 12, opacity: 0.85 }}>Lunch minutes</div>
-                <input
-                  value={String(jobRules.lunch.minutes)}
-                  onChange={(e) => {
-                    const mins = Math.max(0, Math.round(safeNumber(e.target.value, jobRules.lunch.minutes)));
-                    updateCurrent({ lunch: { ...jobRules.lunch, minutes: mins } });
-                  }}
-                  inputMode="numeric"
-                  style={inputStyle}
-                />
-              </div>
+    <div>
+      <div style={{ fontSize: 12, opacity: 0.85 }}>If working through lunch (× factor)</div>
+      <input
+        value={String(jobRules.lunch.workMultiplier)}
+        onChange={(e) => {
+          const mult = safeNumber(e.target.value, jobRules.lunch.workMultiplier);
+          updateCurrent({ lunch: { ...jobRules.lunch, workMultiplier: mult } });
+        }}
+        inputMode="decimal"
+        style={inputStyle}
+      />
+    </div>
 
-              <div>
-                <div style={{ fontSize: 12, opacity: 0.85 }}>If working through lunch (× factor)</div>
-                <input
-                  value={String(jobRules.lunch.workMultiplier)}
-                  onChange={(e) => {
-                    const mult = safeNumber(e.target.value, jobRules.lunch.workMultiplier);
-                    updateCurrent({ lunch: { ...jobRules.lunch, workMultiplier: mult } });
-                  }}
-                  inputMode="decimal"
-                  style={inputStyle}
-                />
-              </div>
-            </div>
+    <div style={{ gridColumn: "1 / -1", fontSize: 12, opacity: 0.75 }}>
+      Paid lunch is enabled: lunch minutes remain paid, and “worked through lunch” can later apply the multiplier.
+    </div>
+  </div>
+) : (
+  <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
+    Paid lunch is off — nothing extra to configure.
+  </div>
+)}
 
-            <div style={{ marginTop: 8, fontSize: 12, opacity: 0.75 }}>
-              Placeholder for engine: unpaid lunch could be deducted unless marked “worked”, then paid at the lunch
-              multiplier.
-            </div>
           </div>
 
           {/* 4) Overtime */}

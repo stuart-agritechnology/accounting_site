@@ -254,36 +254,53 @@ async function createLeaveApplicationsInXero(args: {
   if (!leaveApplications.length) return { ok: true as const, status: 200, json: null, text: "" };
 
   const url = "https://api.xero.com/payroll.xro/1.0/LeaveApplications";
-  const res = await fetchWithTimeout(
-    url,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Xero-tenant-id": tenantId,
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
+
+  // ✅ Minimal fix:
+  // Xero Payroll AU rejects "multiple Leave Applications for an employee in one call".
+  // Our builder often creates 1 leave application per day, so employees can have multiple
+  // in a pay period. Push them one-by-one (array root with a single item).
+  let lastStatus = 200;
+  let lastText = "";
+  let lastJson: any = null;
+
+  for (let i = 0; i < leaveApplications.length; i++) {
+    const app = leaveApplications[i];
+
+    // Per-app idempotency key so retries don't duplicate leave.
+    const perAppKey = `${idempotencyKey ? idempotencyKey + "-" : ""}${hashLeaveApps([app])}`;
+
+    const res = await fetchWithTimeout(
+      url,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Xero-tenant-id": tenantId,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          ...(perAppKey ? { "Idempotency-Key": perAppKey } : {}),
+        },
+        body: JSON.stringify([app]),
+        cache: "no-store",
       },
-      body: JSON.stringify(leaveApplications),
-      cache: "no-store",
-    },
-    20000,
-  );
+      20000,
+    );
 
-  const text = await res.text().catch(() => "");
-  let json: any = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    json = null;
+    lastStatus = res.status;
+    lastText = await res.text().catch(() => "");
+    lastJson = null;
+    try {
+      lastJson = lastText ? JSON.parse(lastText) : null;
+    } catch {
+      lastJson = null;
+    }
+
+    if (!res.ok) {
+      return { ok: false as const, status: res.status, json: lastJson, text: lastText };
+    }
   }
 
-  if (!res.ok) {
-    return { ok: false as const, status: res.status, json, text };
-  }
-
-  return { ok: true as const, status: res.status, json, text };
+  return { ok: true as const, status: lastStatus, json: lastJson, text: lastText };
 }
 
 /**
@@ -543,11 +560,10 @@ export async function POST(req: Request) {
     }
 
     const xero = await getAuthedXeroClient();
-const { tenantId } = await getTenantOrPickFirst(xero);
+    const { tenantId } = await getTenantOrPickFirst(xero);
 
-const tokenSet = (xero as any).readTokenSet?.() ?? null;
-const accessToken = (tokenSet?.access_token ?? tokenSet?.accessToken ?? "") as string;
-
+    const tokenSet = (xero as any).readTokenSet?.() ?? null;
+    const accessToken = (tokenSet?.access_token ?? tokenSet?.accessToken ?? "") as string;
 
     if (!accessToken) {
       return NextResponse.json(
@@ -625,7 +641,9 @@ const accessToken = (tokenSet?.access_token ?? tokenSet?.accessToken ?? "") as s
       accessToken,
       tenantId,
       leaveApplications: leaveBuilt.leaveApplications,
-      idempotencyKey: `leave-v3-${periodStartISO}-${periodEndISOInclusive}-${Date.now()}-${crypto.randomBytes(6).toString("hex")}`,
+      idempotencyKey: `leave-v3-${periodStartISO}-${periodEndISOInclusive}-${Date.now()}-${crypto
+        .randomBytes(6)
+        .toString("hex")}`,
     });
 
     if (!leavePush.ok) {

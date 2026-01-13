@@ -8,6 +8,8 @@ import { saveActivePayPeriod } from "../../_lib/payPeriod";
 type XeroEmployee = {
   employeeID: string;
   fullName: string;
+  baseRate?: number | null;
+  weeklyHours?: number | null;
   firstName?: string;
   lastName?: string;
   status?: string;
@@ -15,7 +17,7 @@ type XeroEmployee = {
 
 type SyncMeta = {
   lastSyncAt: string | null;
-  lastSyncedIds: string[]; // ids that were "new" in last sync
+  lastSyncedIds: string[];
 };
 
 const LS_XERO_EMPLOYEES = "xero_employees_v1";
@@ -25,18 +27,18 @@ function normalizeName(name: string) {
   return name.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-function pill(text: string, tone: "green" | "gray" | "amber") {
+function pill(text: string, tone: "green" | "red" | "purple") {
   const bg =
     tone === "green"
-      ? "rgba(34,197,94,0.15)"
-      : tone === "amber"
-      ? "rgba(245,158,11,0.15)"
-      : "rgba(255,255,255,0.08)";
+      ? "rgba(34,197,94,0.18)"
+      : tone === "red"
+      ? "rgba(239,68,68,0.18)"
+      : "rgba(168,85,247,0.18)";
   const border =
     tone === "green"
       ? "rgba(34,197,94,0.35)"
-      : tone === "amber"
-      ? "rgba(245,158,11,0.35)"
+      : tone === "red"
+      ? "rgba(239,68,68,0.35)"
       : "rgba(255,255,255,0.18)";
 
   return (
@@ -57,15 +59,42 @@ function pill(text: string, tone: "green" | "gray" | "amber") {
   );
 }
 
-// ✅ NEW: sort priority so "not synced/matched" always floats to the top
-function matchPriority(row: { mgmt?: any; xero?: any }) {
+// 0 = needs attention (red), 1 = OK (green/purple)
+function matchPriority(row: { mgmt?: any; xero?: any; noTimesheets?: boolean }) {
   const fromMgmt = !!row.mgmt;
   const fromXero = !!row.xero;
-
-  // 0 = needs attention (not matched)
-  // 1 = matched (green)
-  if (fromMgmt && fromXero) return 1;
+  if (fromMgmt && fromXero) return 1; // matched
+  if (fromXero && !fromMgmt && row.noTimesheets) return 1; // purple = OK
   return 0;
+}
+
+async function mergeDbSettingsIntoXeroList(current: XeroEmployee[]): Promise<XeroEmployee[]> {
+  try {
+    const res = await fetch("/api/payroll/employees", { method: "GET", cache: "no-store" });
+    const j = await res.json().catch(() => null);
+    if (!res.ok || !j?.ok || !Array.isArray(j?.employees)) return current;
+
+    const rows = j.employees as any[];
+    const byId = new Map<string, any>();
+    for (const r of rows) {
+      const id = String(r?.xeroEmployeeId ?? "").trim();
+      if (id) byId.set(id, r);
+    }
+
+    return current.map((x) => {
+      const id = String(x.employeeID ?? "").trim();
+      const r = byId.get(id);
+      if (!r) return x;
+      return {
+        ...x,
+        baseRate: typeof r?.baseRate === "number" ? r.baseRate : x.baseRate,
+        weeklyHours: typeof r?.weeklyHours === "number" ? r.weeklyHours : x.weeklyHours,
+        ...(typeof r?.noTimesheets === "boolean" ? { noTimesheets: r.noTimesheets } : {}),
+      } as any;
+    });
+  } catch {
+    return current;
+  }
 }
 
 export default function EmployeesPage() {
@@ -75,17 +104,25 @@ export default function EmployeesPage() {
   const [syncing, setSyncing] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // Load persisted Xero state on mount
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(LS_XERO_EMPLOYEES);
-      if (raw) setXeroEmployees(JSON.parse(raw));
-    } catch {}
+    (async () => {
+      try {
+        const raw = localStorage.getItem(LS_XERO_EMPLOYEES);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          const merged = await mergeDbSettingsIntoXeroList(Array.isArray(parsed) ? parsed : []);
+          setXeroEmployees(merged);
+          try {
+            localStorage.setItem(LS_XERO_EMPLOYEES, JSON.stringify(merged));
+          } catch {}
+        }
+      } catch {}
 
-    try {
-      const raw = localStorage.getItem(LS_XERO_SYNC_META);
-      if (raw) setSyncMeta(JSON.parse(raw));
-    } catch {}
+      try {
+        const raw = localStorage.getItem(LS_XERO_SYNC_META);
+        if (raw) setSyncMeta(JSON.parse(raw));
+      } catch {}
+    })();
   }, []);
 
   function persistXero(next: XeroEmployee[]) {
@@ -109,10 +146,7 @@ export default function EmployeesPage() {
     try {
       const res = await fetch("/api/xero/employees", { method: "GET", cache: "no-store" });
       const json = await res.json().catch(() => null);
-
-      if (!res.ok || !json?.ok) {
-        throw new Error(json?.error || `Xero sync failed (${res.status})`);
-      }
+      if (!res.ok || !json?.ok) throw new Error(json?.error || `Xero sync failed (${res.status})`);
 
       const incoming: XeroEmployee[] = (json.employees ?? []).map((e: any) => ({
         employeeID: String(e.employeeID ?? ""),
@@ -120,6 +154,9 @@ export default function EmployeesPage() {
         firstName: e.firstName,
         lastName: e.lastName,
         status: e.status,
+        baseRate: typeof e.baseRate === "number" ? e.baseRate : null,
+        weeklyHours: typeof e.weeklyHours === "number" ? e.weeklyHours : null,
+        noTimesheets: typeof e.noTimesheets === "boolean" ? e.noTimesheets : false,
       }));
 
       const existingIds = new Set(xeroEmployees.map((e) => e.employeeID));
@@ -127,23 +164,22 @@ export default function EmployeesPage() {
         .filter((e) => e.employeeID && !existingIds.has(e.employeeID))
         .map((e) => e.employeeID);
 
-      persistXero(incoming);
+      const mergedIncoming = await mergeDbSettingsIntoXeroList(incoming as any);
+      persistXero(mergedIncoming);
 
       if (json?.suggestedPeriod?.startISO && json?.suggestedPeriod?.endISOExclusive) {
         try {
           saveActivePayPeriod({
             startISO: String(json.suggestedPeriod.startISO),
             endISO: String(json.suggestedPeriod.endISOExclusive),
-            cycle: (json.suggestedPeriod.cycle as any) || "fortnightly",
+            // If Xero doesn't return a cycle, default to weekly to avoid doubling salaried weeklyHours.
+            cycle: (json.suggestedPeriod.cycle as any) || "weekly",
             computedAtISO: new Date().toISOString(),
           });
-        } catch {
-          // ignore
-        }
+        } catch {}
       }
 
       persistSyncMeta({ lastSyncAt: new Date().toISOString(), lastSyncedIds: newlySyncedIds });
-
       window.setTimeout(() => {
         persistSyncMeta((prev) => ({ ...prev, lastSyncedIds: [] }));
       }, 10000);
@@ -154,12 +190,14 @@ export default function EmployeesPage() {
     }
   }
 
-  const mgmtRates = payroll.employees ?? [];
+  // NOTE: payroll.employees is your DB/overrides list.
+  // Matching MUST be Fergus-vs-Xero, so we only use payroll.employees for overrides like noTimesheets.
+  const dbEmployees = payroll.employees ?? [];
 
-  // ✅ Management Software employees are derived from pulled time entries (Fergus)
-  const mgmtEmployees = useMemo(() => {
+  // ✅ Fergus presence = appears in rawTimeEntries (NOT the DB list)
+  const fergusEmployees = useMemo(() => {
     const seen = new Set<string>();
-    const out: Array<{ name: string; id?: string; baseRate?: number }> = [];
+    const out: Array<{ name: string }> = [];
 
     const entries = payroll.rawTimeEntries ?? [];
     for (const te of entries) {
@@ -168,46 +206,22 @@ export default function EmployeesPage() {
       const key = normalizeName(name);
       if (seen.has(key)) continue;
       seen.add(key);
-
-      // try to attach any stored baseRate (if you maintain rates separately)
-      const rateRow = mgmtRates.find((e: any) => normalizeName(String(e?.name ?? "")) === key);
-      out.push({
-        name,
-        id: rateRow?.id,
-        baseRate: typeof rateRow?.baseRate === "number" ? rateRow.baseRate : undefined,
-      });
+      out.push({ name });
     }
 
-    // also include any manually maintained rate rows even if they have no time entries yet
-    for (const e of mgmtRates) {
-      const name = String((e as any)?.name ?? "").trim();
-      if (!name) continue;
-      const key = normalizeName(name);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push({ name, id: (e as any)?.id, baseRate: typeof (e as any)?.baseRate === "number" ? (e as any).baseRate : undefined });
-    }
-
-    // stable sort
     out.sort((a, b) => a.name.localeCompare(b.name));
     return out;
-  }, [payroll.rawTimeEntries, mgmtRates]);
+  }, [payroll.rawTimeEntries]);
 
   const merged = useMemo(() => {
     const map = new Map<
       string,
-      {
-        key: string;
-        name: string;
-        mgmt?: { id?: string; baseRate?: number };
-        xero?: XeroEmployee;
-        newlySynced?: boolean;
-      }
+      { key: string; name: string; mgmt?: { name: string }; xero?: XeroEmployee; newlySynced?: boolean; noTimesheets?: boolean }
     >();
 
-    for (const c of mgmtEmployees) {
-      const key = normalizeName(c.name);
-      map.set(key, { key, name: c.name.trim(), mgmt: { id: c.id, baseRate: (c as any).baseRate } });
+    for (const m of fergusEmployees) {
+      const key = normalizeName(m.name);
+      map.set(key, { key, name: m.name.trim(), mgmt: { name: m.name.trim() } });
     }
 
     for (const x of xeroEmployees) {
@@ -219,31 +233,36 @@ export default function EmployeesPage() {
 
     const out = Array.from(map.values());
 
-    // ✅ NEW: compute "newlySynced" BEFORE sort (doesn't matter, but clean)
+    // Apply noTimesheets override from DB keyed by xeroEmployeeId
+    const byXeroId = new Map<string, any>();
+    for (const e of dbEmployees as any[]) {
+      const xid = String((e as any)?.xeroEmployeeId ?? "").trim();
+      if (xid) byXeroId.set(xid, e);
+    }
+
     const newly = new Set(syncMeta.lastSyncedIds);
     for (const r of out) {
       r.newlySynced = r.xero?.employeeID ? newly.has(r.xero.employeeID) : false;
+      const xid = r.xero?.employeeID ? String(r.xero.employeeID) : "";
+      const hit = xid ? byXeroId.get(xid) : null;
+      r.noTimesheets = Boolean(hit?.noTimesheets);
     }
 
-    // ✅ NEW SORT:
-    // 1) Unmatched (CSV-only or Xero-only) always at top
-    // 2) Matched (green) always below
-    // 3) Then alphabetical within each group
     out.sort((a, b) => {
       const pa = matchPriority(a);
       const pb = matchPriority(b);
-      if (pa !== pb) return pa - pb; // 0 first, 1 last
+      if (pa !== pb) return pa - pb; // attention first
       return a.name.localeCompare(b.name);
     });
 
     return out;
-  }, [mgmtEmployees, xeroEmployees, syncMeta.lastSyncedIds]);
+  }, [fergusEmployees, xeroEmployees, dbEmployees, syncMeta.lastSyncedIds]);
 
   return (
     <div style={{ padding: 18 }}>
       <PageHeader
         title="Employees"
-        subtitle="One view of Management Software + Xero employees. Sync pulls from Xero and highlights changes."
+        subtitle="Green = Fergus + Xero match. Red = mismatch. Purple = Xero only (no timesheets)."
         right={
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
             {syncMeta.lastSyncAt ? (
@@ -285,11 +304,10 @@ export default function EmployeesPage() {
         </div>
       ) : null}
 
-      {/* ✅ NEW: unmatched summary */}
       {(() => {
-        const mgmtOnly = merged.filter((r) => !!r.mgmt && !r.xero);
-        const xeroOnly = merged.filter((r) => !r.mgmt && !!r.xero);
-        const total = mgmtOnly.length + xeroOnly.length;
+        const fergusOnly = merged.filter((r) => !!r.mgmt && !r.xero);
+        const xeroOnly = merged.filter((r) => !r.mgmt && !!r.xero && !r.noTimesheets);
+        const total = fergusOnly.length + xeroOnly.length;
         if (!total) return null;
         return (
           <div
@@ -302,7 +320,7 @@ export default function EmployeesPage() {
               fontWeight: 800,
             }}
           >
-            Needs matching: {mgmtOnly.length} management-only, {xeroOnly.length} Xero-only.
+            Needs matching: {fergusOnly.length} Fergus-only, {xeroOnly.length} Xero-only.
           </div>
         );
       })()}
@@ -315,7 +333,6 @@ export default function EmployeesPage() {
           overflow: "hidden",
         }}
       >
-        {/* ✅ Added Xero ID column */}
         <div
           style={{
             display: "grid",
@@ -326,22 +343,25 @@ export default function EmployeesPage() {
           }}
         >
           <div>Name</div>
-          <div>Management</div>
+          <div>Fergus</div>
           <div>Xero</div>
           <div>Xero Employee ID</div>
           <div>Status</div>
         </div>
 
         {merged.map((r) => {
-          const fromMgmt = !!r.mgmt;
+          const fromFergus = !!r.mgmt;
           const fromXero = !!r.xero;
+          const isNoTimesheets = Boolean((r as any).noTimesheets);
 
           const status =
-            fromMgmt && fromXero
+            fromFergus && fromXero
               ? pill("Matched", "green")
+              : fromXero && !fromFergus && isNoTimesheets
+              ? pill("No timesheets", "purple")
               : fromXero
-              ? pill("Xero only", "amber")
-              : pill("Management only", "gray");
+              ? pill("Xero only", "red")
+              : pill("Fergus only", "red");
 
           return (
             <div
@@ -353,7 +373,9 @@ export default function EmployeesPage() {
                 borderTop: "1px solid rgba(255,255,255,0.08)",
                 background: r.newlySynced
                   ? "rgba(34,197,94,0.08)"
-                  : !fromMgmt || !fromXero
+                  : fromXero && !fromFergus && isNoTimesheets
+                  ? "rgba(168,85,247,0.06)"
+                  : !fromFergus || !fromXero
                   ? "rgba(239,68,68,0.06)"
                   : "transparent",
                 transition: "background 400ms ease",
@@ -361,12 +383,14 @@ export default function EmployeesPage() {
             >
               <div style={{ fontWeight: 800 }}>{r.name}</div>
 
+              <div style={{ opacity: 0.9 }}>{fromFergus ? <span>✓</span> : <span style={{ opacity: 0.55 }}>—</span>}</div>
+
               <div style={{ opacity: 0.9 }}>
-                {fromMgmt ? (
+                {fromXero ? (
                   <span>
                     ✓{" "}
-                    {typeof r.mgmt!.baseRate === "number" ? (
-                      <span style={{ opacity: 0.75 }}>${r.mgmt!.baseRate}/hr</span>
+                    {typeof r.xero?.baseRate === "number" ? (
+                      <span style={{ opacity: 0.75 }}>${r.xero.baseRate}/hr</span>
                     ) : (
                       <span style={{ opacity: 0.55 }}>rate not set</span>
                     )}
@@ -376,19 +400,50 @@ export default function EmployeesPage() {
                 )}
               </div>
 
-              <div style={{ opacity: 0.9 }}>{fromXero ? <span>✓</span> : <span style={{ opacity: 0.55 }}>—</span>}</div>
-
-              {/* ✅ NEW: Xero Employee ID */}
-              <div
-                style={{
-                  opacity: 0.9,
-                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                }}
-              >
+              <div style={{ opacity: 0.9, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}>
                 {fromXero && r.xero?.employeeID ? r.xero.employeeID : <span style={{ opacity: 0.55 }}>—</span>}
               </div>
 
               <div style={{ display: "flex", justifyContent: "flex-start", gap: 10, alignItems: "center" }}>
+                {fromXero ? (
+                  <label style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 6, opacity: 0.95 }}>
+                    <input
+                      type="checkbox"
+                      checked={Boolean((r as any).noTimesheets)}
+                      onChange={(ev) => {
+                        if (!r.xero?.employeeID) return;
+                        const xid = String(r.xero.employeeID);
+
+                        const existing =
+                          (payroll.employees ?? []).find((e: any) => String(e?.xeroEmployeeId ?? e?.id ?? "") === xid) ?? null;
+
+                        payroll.upsertEmployee({
+                          id: existing?.id ?? xid,
+                          name: existing?.name ?? r.name,
+                          baseRate:
+                            typeof existing?.baseRate === "number"
+                              ? existing.baseRate
+                              : typeof r.xero?.baseRate === "number"
+                              ? (r.xero.baseRate as any)
+                              : null,
+                          xeroEmployeeId: xid,
+                          status: r.xero?.status,
+                          noTimesheets: ev.target.checked,
+                          weeklyHours:
+                            typeof (existing as any)?.weeklyHours === "number"
+                              ? (existing as any).weeklyHours
+                              : typeof r.xero?.weeklyHours === "number"
+                              ? r.xero.weeklyHours
+                              : null,
+                        } as any);
+                      }}
+                    />
+                    <span style={{ fontSize: 12, fontWeight: 800 }}>
+                      Auto (no timesheets){typeof r.xero?.weeklyHours === "number" ? ` • ${r.xero.weeklyHours}h/wk` : ""}
+                    </span>
+                  </label>
+                ) : null}
+
                 {status}
                 {r.newlySynced ? pill("New", "green") : null}
               </div>

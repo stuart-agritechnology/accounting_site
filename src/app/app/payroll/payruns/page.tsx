@@ -16,6 +16,14 @@ const LS_XERO_LAST_PUSH = "xero_last_push_report_v1";
 const LS_XERO_EMPLOYEES = "xero_employees_v1";
 
 /**
+ * Leave costing
+ * - We show an estimated cost for leave lines so you can "see the cost"
+ * - For now we apply a simple loading multiplier (common AU annual leave loading is 17.5%)
+ * - You can later refine this per leave type (annual vs personal), award, super, workers comp, etc.
+ */
+const LEAVE_LOADING_MULT = 1.175; // 17.5% loading (placeholder)
+
+/**
  * ✅ NEW: Store the last push report + notify Employees page to refresh.
  * (Employees page listens for "xero-push-updated")
  */
@@ -98,9 +106,13 @@ function displayDateFromKey(key: string): string {
 type EmpAgg = {
   employeeId: string;
   employeeName: string;
-  totalMinutes: number;
+  totalMinutes: number; // kept for calc / legacy, NOT displayed in UI anymore
   totalHours: number;
-  totalCost: number;
+  totalCost: number; // worked cost (non-leave)
+  leaveHours: number;
+  leaveCost: number; // estimated leave cost
+  overtimeCost: number;
+  overtimeExtraCost: number;
   lines: any[];
 };
 
@@ -111,9 +123,10 @@ export default function PayrunsPage() {
   // which employee row is expanded
   const [openEmpKey, setOpenEmpKey] = useState<string | null>(null);
 
-  // ============================
+  // ✅ selection state (default ON)
+  const [selectedByEmpKey, setSelectedByEmpKey] = useState<Record<string, boolean>>({});
+
   // Xero employee rate map (from Employees page cache)
-  // ============================
   const [xeroRateByName, setXeroRateByName] = useState<Map<string, number>>(new Map());
 
   function loadXeroEmployeeRatesFromLocalStorage() {
@@ -148,21 +161,18 @@ export default function PayrunsPage() {
     }
   }
 
-  // ============================
   // Xero status + push state
-  // ============================
   const [xeroConnected, setXeroConnected] = useState<boolean>(false);
   const [xeroTenantName, setXeroTenantName] = useState<string>("");
   const [xeroPushBusy, setXeroPushBusy] = useState<boolean>(false);
   const [xeroPushMsg, setXeroPushMsg] = useState<string>("");
 
-  // ✅ hover state for the Xero button (since inline styles can't do :hover)
+  // hover state for the Xero button (since inline styles can't do :hover)
   const [xeroBtnHover, setXeroBtnHover] = useState(false);
 
   useEffect(() => {
     let alive = true;
 
-    // Load Xero connection status
     fetch("/api/xero/status")
       .then((r) => r.json())
       .then((j) => {
@@ -175,10 +185,8 @@ export default function PayrunsPage() {
         setXeroConnected(false);
       });
 
-    // Load employee rates from Employees cache on mount
     loadXeroEmployeeRatesFromLocalStorage();
 
-    // Keep in sync if other pages update localStorage
     const onStorage = (ev: StorageEvent) => {
       if (ev.key === LS_XERO_EMPLOYEES) {
         loadXeroEmployeeRatesFromLocalStorage();
@@ -186,7 +194,6 @@ export default function PayrunsPage() {
     };
     window.addEventListener("storage", onStorage);
 
-    // Optional: you can dispatch this event anywhere after syncing employees
     const onEmployeesUpdated = () => loadXeroEmployeeRatesFromLocalStorage();
     window.addEventListener("xero-employees-updated", onEmployeesUpdated as any);
 
@@ -197,9 +204,7 @@ export default function PayrunsPage() {
     };
   }, []);
 
-  // ============================
-  // Better error formatting helpers (ADDED)
-  // ============================
+  // Better error formatting helpers
   function pretty(v: any): string {
     if (v == null) return "";
     if (typeof v === "string") return v;
@@ -219,7 +224,6 @@ export default function PayrunsPage() {
   }): string {
     const { endpoint, status, contentType, payload, rawText } = args;
 
-    // Try to extract the most useful error text from typical Xero / server payloads
     const serverErr =
       payload?.error ??
       payload?.message ??
@@ -233,7 +237,6 @@ export default function PayrunsPage() {
 
     const serverErrStr = typeof serverErr === "string" ? serverErr : pretty(serverErr);
 
-    // Warnings (your API already returns these)
     const warns = payload?.warnings ?? {};
     const missE = (warns?.missingEmployees ?? []) as string[];
     const missC = (warns?.missingCategories ?? []) as Array<any>;
@@ -245,7 +248,6 @@ export default function PayrunsPage() {
       warnParts.push(`Unmapped categories: ${uniq.join(", ")}`);
     }
 
-    // Per-employee errors (your API returns errors[])
     const errs = (payload?.errors ?? []) as Array<{ employeeName: string; error: string }>;
     const errText =
       errs.length > 0
@@ -255,14 +257,16 @@ export default function PayrunsPage() {
             .join(", ")}${errs.length > 8 ? " …" : ""}`
         : "";
 
-    // Hints
     const m = serverErrStr.toLowerCase();
     let fix = "";
     if (status === 401 || status === 403 || m.includes("unauthor") || m.includes("forbidden") || m.includes("scope")) {
       fix = "Fix: Reconnect Xero and ensure scopes include payroll.settings + payroll.timesheets.";
     } else if (contentType.includes("text/html") || m.includes("<html")) {
       fix = "Fix: The API returned HTML (likely auth redirect). Check getAuthedXeroClient() and cookies/session.";
-    } else if (status === 400 && (m.includes("paylines had no usable rows") || m.includes("no paylines") || m.includes("missing period"))) {
+    } else if (
+      status === 400 &&
+      (m.includes("paylines had no usable rows") || m.includes("no paylines") || m.includes("missing period"))
+    ) {
       fix = "Fix: Click 'Compute' first, and ensure pay lines have employeeName + date + category + hours (>0).";
     } else if (status === 400 && (m.includes("enddate") || m.includes("startdate") || m.includes("date"))) {
       fix = "Fix: Check your pay period start/end. This app uses an INCLUSIVE end date (same as Xero timesheets).";
@@ -285,35 +289,196 @@ export default function PayrunsPage() {
     return details.filter(Boolean).join("  •  ");
   }
 
-  async function pushTimesheetsToXero() {
+  // Aggregate per employee
+  const perEmployee = useMemo<EmpAgg[]>(() => {
+    const map = new Map<string, EmpAgg>();
+
+    for (const l of payLines as any[]) {
+      const employeeName = String(l.employeeName ?? "—");
+      const employeeId = String(l.employeeId ?? employeeName);
+      const key = employeeId || employeeName;
+
+      const cur =
+        map.get(key) ??
+        ({
+          employeeId,
+          employeeName,
+          totalMinutes: 0,
+          totalHours: 0,
+          totalCost: 0,
+          overtimeCost: 0,
+          overtimeExtraCost: 0,
+          leaveHours: 0,
+          leaveCost: 0,
+          lines: [],
+        } as EmpAgg);
+
+      const minutes = n(l.minutes, 0);
+      const hours = hoursFromLine(l);
+      const cost = n(l.cost, 0);
+
+      const multNum = n(l?.multiplier, 1);
+      const mult = Number.isFinite(multNum) && multNum > 0 ? multNum : 1;
+
+      const xeroRate = xeroRateByName.get(normName(employeeName)) ?? null;
+      const lineRate = l?.baseRate != null ? n(l.baseRate, NaN) : NaN;
+      const chosenRate =
+        xeroRate != null && Number.isFinite(xeroRate) && xeroRate > 0
+          ? xeroRate
+          : Number.isFinite(lineRate) && lineRate > 0
+            ? lineRate
+            : NaN;
+
+      const ordinaryCostGuess =
+        Number.isFinite(chosenRate) ? hours * (chosenRate as number) : mult > 0 ? cost / mult : 0;
+
+      const isLeaveRow = !!l?.isLeave;
+
+      if (isLeaveRow) {
+        const leaveEst =
+          Number.isFinite(chosenRate)
+            ? hours * (chosenRate as number) * LEAVE_LOADING_MULT
+            : Number.isFinite(cost)
+              ? cost
+              : 0;
+
+        cur.leaveHours += hours;
+        cur.leaveCost += Math.max(0, leaveEst);
+      } else {
+        cur.totalMinutes += minutes;
+        cur.totalHours += hours;
+        cur.totalCost += cost;
+
+        if (mult > 1) {
+          cur.overtimeCost += cost;
+          const extra = Math.max(0, cost - ordinaryCostGuess);
+          cur.overtimeExtraCost += extra;
+        }
+      }
+
+      cur.lines.push(l);
+      map.set(key, cur);
+    }
+
+    const arr = Array.from(map.values());
+
+    // ✅ UPDATED: sort by total payable (worked + leave), then name
+    arr.sort((a, b) => {
+      const aPayable = (a.totalCost || 0) + (a.leaveCost || 0);
+      const bPayable = (b.totalCost || 0) + (b.leaveCost || 0);
+      const dc = bPayable - aPayable;
+      if (Math.abs(dc) > 1e-9) return dc;
+      return a.employeeName.localeCompare(b.employeeName);
+    });
+
+    for (const e of arr) {
+      e.lines.sort((a: any, b: any) => {
+        const da = lineDateKey(a);
+        const db = lineDateKey(b);
+        if (da !== db) return da.localeCompare(db);
+
+        const ca = String(a.category ?? "");
+        const cb = String(b.category ?? "");
+        if (ca !== cb) return ca.localeCompare(cb);
+
+        return String(a.jobCode ?? "").localeCompare(String(b.jobCode ?? ""));
+      });
+    }
+
+    return arr;
+  }, [payLines, xeroRateByName]);
+
+  // total leave cost
+  const totalLeaveCost = useMemo(() => {
+    return perEmployee.reduce((acc, e) => acc + n((e as any)?.leaveCost, 0), 0);
+  }, [perEmployee]);
+
+  // ✅ NEW: total payable in this UI = worked + leave
+  const totalPayrunPayable = useMemo(() => {
+    return n(summary.totalCost, 0) + n(totalLeaveCost, 0);
+  }, [summary.totalCost, totalLeaveCost]);
+
+  // default selection to ON whenever perEmployee changes
+  useEffect(() => {
+    setSelectedByEmpKey((prev) => {
+      const next: Record<string, boolean> = { ...prev };
+      for (const emp of perEmployee) {
+        const k = String(emp.employeeId || emp.employeeName);
+        if (next[k] === undefined) next[k] = true;
+      }
+      for (const k of Object.keys(next)) {
+        if (!perEmployee.some((e) => String(e.employeeId || e.employeeName) === k)) {
+          delete next[k];
+        }
+      }
+      return next;
+    });
+  }, [perEmployee]);
+
+  const selectedKeys = useMemo(() => {
+    return new Set(Object.entries(selectedByEmpKey).filter(([, v]) => v).map(([k]) => k));
+  }, [selectedByEmpKey]);
+
+  const selectedEmployeesCount = useMemo(() => {
+    return perEmployee.filter((e) => selectedByEmpKey[String(e.employeeId || e.employeeName)] !== false).length;
+  }, [perEmployee, selectedByEmpKey]);
+
+  const allSelected = useMemo(() => {
+    if (!perEmployee.length) return false;
+    return perEmployee.every((e) => selectedByEmpKey[String(e.employeeId || e.employeeName)] !== false);
+  }, [perEmployee, selectedByEmpKey]);
+
+  const anySelected = useMemo(() => {
+    return perEmployee.some((e) => selectedByEmpKey[String(e.employeeId || e.employeeName)] !== false);
+  }, [perEmployee, selectedByEmpKey]);
+
+  function setAllSelected(v: boolean) {
+    setSelectedByEmpKey((prev) => {
+      const next = { ...prev };
+      for (const emp of perEmployee) {
+        const k = String(emp.employeeId || emp.employeeName);
+        next[k] = v;
+      }
+      return next;
+    });
+  }
+
+  async function pushTimesheetsToXeroSelected() {
     setXeroPushMsg("");
 
     const period = loadActivePayPeriod();
     if (!period) {
       const msg = "No active pay period selected. Go to Import and set the pay period.";
       setXeroPushMsg(msg);
-
-      // ✅ store failure report too (so Employees page shows something)
-      storeLastXeroPushReport({
-        ok: false,
-        error: msg,
-        pushedAtISO: new Date().toISOString(),
-      });
-
+      storeLastXeroPushReport({ ok: false, error: msg, pushedAtISO: new Date().toISOString() });
       return;
     }
 
     if (!payLines?.length) {
       const msg = "No pay lines to push.";
       setXeroPushMsg(msg);
+      storeLastXeroPushReport({ ok: false, error: msg, pushedAtISO: new Date().toISOString() });
+      return;
+    }
 
-      // ✅ store failure report too (so Employees page shows something)
-      storeLastXeroPushReport({
-        ok: false,
-        error: msg,
-        pushedAtISO: new Date().toISOString(),
-      });
+    if (!anySelected) {
+      const msg = "No employees selected. Tick at least one employee to push.";
+      setXeroPushMsg(msg);
+      storeLastXeroPushReport({ ok: false, error: msg, pushedAtISO: new Date().toISOString() });
+      return;
+    }
 
+    const filteredPayLines = (payLines as any[]).filter((l) => {
+      const employeeName = String(l?.employeeName ?? "—");
+      const employeeId = String(l?.employeeId ?? employeeName);
+      const key = employeeId || employeeName;
+      return selectedKeys.has(String(key));
+    });
+
+    if (filteredPayLines.length === 0) {
+      const msg = "Selected employees have no pay lines to push.";
+      setXeroPushMsg(msg);
+      storeLastXeroPushReport({ ok: false, error: msg, pushedAtISO: new Date().toISOString() });
       return;
     }
 
@@ -328,11 +493,10 @@ export default function PayrunsPage() {
         body: JSON.stringify({
           periodStartISO: period.startISO,
           periodEndISOInclusive: period.endISO,
-          payLines,
+          payLines: filteredPayLines,
         }),
       });
 
-      // ✅ robust body parsing (handles HTML redirects / non-JSON)
       const ct = res.headers.get("content-type") || "";
       let payload: any = null;
       let rawText = "";
@@ -345,9 +509,6 @@ export default function PayrunsPage() {
 
       (window as any).__lastXeroPush = payload;
 
-      console.log("XERO PUSH payload:", payload);
-
-      // ✅ ALWAYS store the report (success or fail) so Employees page updates
       storeLastXeroPushReport({
         ...(payload ?? {}),
         ok: !!payload?.ok && res.ok,
@@ -357,9 +518,12 @@ export default function PayrunsPage() {
         warnings: payload?.warnings ?? null,
         results: payload?.results ?? null,
         errors: payload?.errors ?? null,
+        selection: {
+          selectedEmployees: Array.from(selectedKeys),
+          selectedPayLinesCount: filteredPayLines.length,
+        },
       });
 
-      // ✅ MUCH clearer failure message
       if (!res.ok || !payload?.ok) {
         setXeroPushMsg(
           buildXeroFailureMessage({
@@ -379,34 +543,26 @@ export default function PayrunsPage() {
 
       const parts: string[] = [];
 
-      // ✅ SAFELY read server counts
       const createdTimesheets = Number(payload?.created ?? 0) || 0;
       const createdLeave = Number(payload?.leave?.created ?? 0) || 0;
 
       const skippedMatch = Number(payload?.skipped?.match ?? 0) || 0;
       const skippedDiff = Number(payload?.skipped?.diff ?? 0) || 0;
 
-      // ---- Timesheets summary ----
+      parts.push(`Pushed selection: ${selectedEmployeesCount} employee${selectedEmployeesCount === 1 ? "" : "s"}.`);
+
       if (createdTimesheets === 0 && (skippedMatch > 0 || skippedDiff > 0)) {
         parts.push(
           `Created 0 timesheets. Already existed in Xero: ${skippedMatch} matching, ${skippedDiff} different (not overwritten).`,
         );
       } else {
-        parts.push(
-          `Created ${createdTimesheets} timesheet${createdTimesheets === 1 ? "" : "s"} in Xero.`,
-        );
-
+        parts.push(`Created ${createdTimesheets} timesheet${createdTimesheets === 1 ? "" : "s"} in Xero.`);
         if (skippedMatch || skippedDiff) {
-          parts.push(
-            `Skipped: ${skippedMatch} already matched, ${skippedDiff} existed but different (not overwritten).`,
-          );
+          parts.push(`Skipped: ${skippedMatch} already matched, ${skippedDiff} existed but different (not overwritten).`);
         }
       }
 
-      // ---- Leave summary ----
-      parts.push(
-        `Created ${createdLeave} leave request${createdLeave === 1 ? "" : "s"} in Xero.`,
-      );
+      parts.push(`Created ${createdLeave} leave request${createdLeave === 1 ? "" : "s"} in Xero.`);
 
       if (missE.length) parts.push(`Missing employees (not found in Xero): ${missE.join(", ")}`);
 
@@ -415,7 +571,6 @@ export default function PayrunsPage() {
         parts.push(`Unmapped categories (no matching Earnings Rate): ${uniq.join(", ")}`);
       }
 
-      // server-side per-employee errors if any
       const errs = (payload?.errors ?? []) as Array<{ employeeName: string; error: string }>;
       if (errs.length) {
         parts.push(
@@ -423,7 +578,6 @@ export default function PayrunsPage() {
         );
       }
 
-      // If nothing was created, show a quick status summary from results[]
       if (createdTimesheets === 0) {
         const results = (payload?.results ?? []) as Array<any>;
         const counts = results.reduce(
@@ -434,12 +588,11 @@ export default function PayrunsPage() {
           },
           {},
         );
-        const summary = Object.entries(counts)
+        const s = Object.entries(counts)
           .map(([k, v]) => `${k}:${v}`)
           .join(", ");
-        if (summary) parts.push(`Result summary: ${summary}`);
+        if (s) parts.push(`Result summary: ${s}`);
 
-        // ✅ If we got ERROR results but no top-level `errors[]`, show the per-employee notes.
         const errNotes = results
           .filter((r: any) => String(r?.status ?? "").toUpperCase() === "ERROR")
           .map((r: any) => {
@@ -454,82 +607,14 @@ export default function PayrunsPage() {
     } catch (e: any) {
       const msg = e?.message ?? "Xero push failed (network)";
       setXeroPushMsg(msg);
-
-      // ✅ store failure report too
-      storeLastXeroPushReport({
-        ok: false,
-        error: msg,
-        pushedAtISO: new Date().toISOString(),
-      });
+      storeLastXeroPushReport({ ok: false, error: msg, pushedAtISO: new Date().toISOString() });
     } finally {
       setXeroPushBusy(false);
     }
   }
 
-  const perEmployee = useMemo<EmpAgg[]>(() => {
-    const map = new Map<string, EmpAgg>();
+  const xeroBtnDisabled = !xeroConnected || xeroPushBusy || !anySelected;
 
-    for (const l of payLines as any[]) {
-      const employeeName = String(l.employeeName ?? "—");
-      const employeeId = String(l.employeeId ?? employeeName);
-      const key = employeeId || employeeName;
-
-      const cur =
-        map.get(key) ??
-        ({
-          employeeId,
-          employeeName,
-          totalMinutes: 0,
-          totalHours: 0,
-          totalCost: 0,
-          lines: [],
-        } as EmpAgg);
-
-      const minutes = n(l.minutes, 0);
-      const hours = hoursFromLine(l);
-      const cost = n(l.cost, 0);
-
-      // ✅ Leave lines are displayed, but do NOT contribute to totals
-      if (!l?.isLeave) {
-        cur.totalMinutes += minutes;
-        cur.totalHours += hours;
-        cur.totalCost += cost;
-      }
-      cur.lines.push(l);
-
-      map.set(key, cur);
-    }
-
-    const arr = Array.from(map.values());
-
-    // sort: biggest cost first, then name
-    arr.sort((a, b) => {
-      const dc = b.totalCost - a.totalCost;
-      if (Math.abs(dc) > 1e-9) return dc;
-      return a.employeeName.localeCompare(b.employeeName);
-    });
-
-    // stable sort inside each employee: date then category then jobCode
-    for (const e of arr) {
-      e.lines.sort((a: any, b: any) => {
-        const da = lineDateKey(a);
-        const db = lineDateKey(b);
-        if (da !== db) return da.localeCompare(db);
-
-        const ca = String(a.category ?? "");
-        const cb = String(b.category ?? "");
-        if (ca !== cb) return ca.localeCompare(cb);
-
-        return String(a.jobCode ?? "").localeCompare(String(b.jobCode ?? ""));
-      });
-    }
-
-    return arr;
-  }, [payLines]);
-
-  const xeroBtnDisabled = !xeroConnected || xeroPushBusy;
-
-  // ✅ Button styles with hover + disabled
   const xeroBtnStyle: React.CSSProperties = {
     padding: "10px 12px",
     borderRadius: 10,
@@ -549,6 +634,18 @@ export default function PayrunsPage() {
     transition:
       "transform 120ms ease, box-shadow 120ms ease, background 120ms ease, opacity 120ms ease, border-color 120ms ease",
     userSelect: "none",
+  };
+
+  const chkWrap: React.CSSProperties = {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+  };
+  const chk: React.CSSProperties = {
+    width: 16,
+    height: 16,
+    accentColor: "#fff",
+    cursor: "pointer",
   };
 
   return (
@@ -575,11 +672,20 @@ export default function PayrunsPage() {
           </div>
         </div>
 
+        {/* ✅ UPDATED: show total payable (worked + leave) */}
         <div style={{ border: "1px solid #2a2a2a", borderRadius: 14, padding: 12, minWidth: 260 }}>
           <div style={{ fontSize: 12, opacity: 0.7 }}>Total payrun cost</div>
-          <div style={{ fontSize: 22, fontWeight: 900 }}>{money(summary.totalCost)}</div>
+          <div style={{ fontSize: 22, fontWeight: 900 }}>{money(totalPayrunPayable)}</div>
           <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
-            Note: cost is computed at “Apply Rules” time. Updating base rate here changes display only.
+            Includes leave estimate shown below. To change true totals, re-run <b>Apply Rules</b>.
+          </div>
+        </div>
+
+        <div style={{ border: "1px solid #2a2a2a", borderRadius: 14, padding: 12, minWidth: 240 }}>
+          <div style={{ fontSize: 12, opacity: 0.7 }}>Leave cost (est)</div>
+          <div style={{ fontSize: 22, fontWeight: 900 }}>{totalLeaveCost > 0 ? money(totalLeaveCost) : "—"}</div>
+          <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
+            Includes a placeholder {Math.round((LEAVE_LOADING_MULT - 1) * 1000) / 10}% loading.
           </div>
         </div>
 
@@ -590,8 +696,7 @@ export default function PayrunsPage() {
           <div style={{ marginTop: 6, fontSize: 13, opacity: 0.85 }}>
             {xeroConnected ? (
               <>
-                Connected
-                {xeroTenantName ? (
+                Connected{xeroTenantName ? (
                   <>
                     {" "}
                     to <b>{xeroTenantName}</b>
@@ -605,17 +710,64 @@ export default function PayrunsPage() {
             )}
           </div>
 
+          <div style={{ marginTop: 10, display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+            <label style={{ ...chkWrap, fontSize: 12, opacity: 0.9 }}>
+              <input
+                type="checkbox"
+                checked={allSelected}
+                onChange={(e) => setAllSelected(e.target.checked)}
+                style={chk}
+              />
+              Select all ({selectedEmployeesCount}/{perEmployee.length})
+            </label>
+
+            <button
+              onClick={() => setAllSelected(true)}
+              style={{
+                padding: "6px 8px",
+                borderRadius: 10,
+                border: "1px solid #2a2a2a",
+                background: "transparent",
+                color: "inherit",
+                cursor: "pointer",
+                fontWeight: 800,
+                fontSize: 12,
+                opacity: 0.9,
+              }}
+            >
+              All
+            </button>
+
+            <button
+              onClick={() => setAllSelected(false)}
+              style={{
+                padding: "6px 8px",
+                borderRadius: 10,
+                border: "1px solid #2a2a2a",
+                background: "transparent",
+                color: "inherit",
+                cursor: "pointer",
+                fontWeight: 800,
+                fontSize: 12,
+                opacity: 0.9,
+              }}
+            >
+              None
+            </button>
+          </div>
+
           <div style={{ marginTop: 10, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
             <button
-              onClick={pushTimesheetsToXero}
-              disabled={xeroBtnDisabled}
+              onClick={pushTimesheetsToXeroSelected}
+              disabled={!xeroConnected || xeroPushBusy || !anySelected}
               style={xeroBtnStyle}
               onMouseEnter={() => setXeroBtnHover(true)}
               onMouseLeave={() => setXeroBtnHover(false)}
               onMouseDown={() => !xeroBtnDisabled && setXeroBtnHover(true)}
               onMouseUp={() => !xeroBtnDisabled && setXeroBtnHover(false)}
+              title={!anySelected ? "Tick at least one employee below" : ""}
             >
-              {xeroPushBusy ? "Sending…" : "Send timesheets to Xero"}
+              {xeroPushBusy ? "Sending…" : `Send selected to Xero (${selectedEmployeesCount})`}
             </button>
 
             {xeroPushMsg ? (
@@ -626,28 +778,24 @@ export default function PayrunsPage() {
       </div>
 
       {/* PER EMPLOYEE SUMMARY (click to expand) */}
-      <div
-        style={{
-          marginTop: 12,
-          border: "1px solid #2a2a2a",
-          borderRadius: 14,
-          overflow: "hidden",
-        }}
-      >
+      <div style={{ marginTop: 12, border: "1px solid #2a2a2a", borderRadius: 14, overflow: "hidden" }}>
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "1.4fr 0.7fr 0.9fr 0.9fr",
+            gridTemplateColumns: "0.35fr 1.05fr 0.7fr 0.95fr 0.95fr 0.95fr 0.9fr",
             padding: 12,
             fontWeight: 700,
             borderBottom: "1px solid #2a2a2a",
             background: "rgba(255,255,255,0.02)",
           }}
         >
+          <div>Push</div>
           <div>Employee</div>
-          <div>Total hours</div>
-          <div>Total minutes</div>
-          <div>Total pay</div>
+          <div>Total Hours</div>
+          <div>Total OT</div>
+          <div>OT Premium</div>
+          <div>Leave (est)</div>
+          <div>Total Pay</div>
         </div>
 
         {perEmployee.length === 0 ? (
@@ -655,20 +803,35 @@ export default function PayrunsPage() {
         ) : null}
 
         {perEmployee.map((emp) => {
-          const key = emp.employeeId || emp.employeeName;
+          const key = String(emp.employeeId || emp.employeeName);
           const isOpen = openEmpKey === key;
+          const isSelected = selectedByEmpKey[key] !== false;
+
+          // ✅ UPDATED: total pay includes leave
+          const empTotalPay = n(emp.totalCost, 0) + n(emp.leaveCost, 0);
 
           return (
             <div key={key} style={{ borderBottom: "1px solid #2a2a2a" }}>
-              {/* summary row */}
               <div
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "1.4fr 0.7fr 0.9fr 0.9fr",
+                  gridTemplateColumns: "0.35fr 1.05fr 0.7fr 0.95fr 0.95fr 0.95fr 0.9fr",
                   padding: 12,
                   alignItems: "center",
                 }}
               >
+                <label style={chkWrap} title="Include this employee when pushing to Xero">
+                  <input
+                    type="checkbox"
+                    checked={isSelected}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setSelectedByEmpKey((prev) => ({ ...prev, [key]: checked }));
+                    }}
+                    style={chk}
+                  />
+                </label>
+
                 <button
                   onClick={() => setOpenEmpKey((cur) => (cur === key ? null : key))}
                   style={{
@@ -679,6 +842,7 @@ export default function PayrunsPage() {
                     padding: 0,
                     cursor: "pointer",
                     fontWeight: 900,
+                    opacity: isSelected ? 1 : 0.6,
                   }}
                   title="Click to expand breakdown"
                 >
@@ -686,22 +850,22 @@ export default function PayrunsPage() {
                   {emp.employeeName}
                 </button>
 
-                <div>{emp.totalHours.toFixed(2)}</div>
-                <div>{Math.round(emp.totalMinutes)}</div>
-                <div style={{ fontWeight: 900 }}>{money(emp.totalCost)}</div>
+                <div style={{ opacity: isSelected ? 1 : 0.6 }}>{emp.totalHours.toFixed(2)}</div>
+                <div style={{ fontWeight: 900, opacity: isSelected ? 1 : 0.6 }}>{money(emp.overtimeCost)}</div>
+                <div style={{ fontWeight: 900, opacity: isSelected ? 1 : 0.6 }}>
+                  {emp.overtimeExtraCost > 0 ? money(emp.overtimeExtraCost) : "—"}
+                </div>
+                <div style={{ fontWeight: 900, opacity: isSelected ? 1 : 0.6 }}>
+                  {emp.leaveCost > 0 ? money(emp.leaveCost) : "—"}
+                </div>
+
+                {/* ✅ UPDATED */}
+                <div style={{ fontWeight: 900, opacity: isSelected ? 1 : 0.6 }}>{money(empTotalPay)}</div>
               </div>
 
-              {/* breakdown */}
               {isOpen ? (
-                <div style={{ padding: 12, paddingTop: 0 }}>
-                  <div
-                    style={{
-                      border: "1px solid #2a2a2a",
-                      borderRadius: 12,
-                      overflow: "hidden",
-                      marginTop: 8,
-                    }}
-                  >
+                <div style={{ padding: 12, paddingTop: 0, opacity: isSelected ? 1 : 0.7 }}>
+                  <div style={{ border: "1px solid #2a2a2a", borderRadius: 12, overflow: "hidden", marginTop: 8 }}>
                     <div
                       style={{
                         display: "grid",
@@ -725,7 +889,6 @@ export default function PayrunsPage() {
                     {emp.lines.map((l: any, i: number) => {
                       const hours = hoursFromLine(l);
 
-                      // ✅ Prefer Xero base rate from Employees cache
                       const xeroRate = xeroRateByName.get(normName(emp.employeeName)) ?? null;
                       const fallbackLineRate = l.baseRate != null ? n(l.baseRate) : null;
                       const chosenRate = xeroRate ?? (fallbackLineRate != null ? fallbackLineRate : null);
@@ -737,6 +900,16 @@ export default function PayrunsPage() {
 
                       const mult = Number.isFinite(n(l.multiplier, NaN)) ? `${n(l.multiplier, 1).toFixed(2)}×` : "—";
 
+                      const isLeaveRow = !!l?.isLeave;
+                      const leaveCostEst =
+                        isLeaveRow && chosenRate != null && Number.isFinite(chosenRate) && chosenRate > 0
+                          ? hours * (chosenRate as number) * LEAVE_LOADING_MULT
+                          : isLeaveRow
+                            ? n(l.cost, 0)
+                            : 0;
+
+                      const costText = isLeaveRow ? `${money(leaveCostEst)} (est)` : money(l.cost);
+
                       return (
                         <div
                           key={`${key}-${lineDateKey(l) || "date"}-${l.jobCode ?? "job"}-${l.category ?? "cat"}-${i}`}
@@ -746,7 +919,6 @@ export default function PayrunsPage() {
                             padding: 10,
                             borderBottom: "1px solid #2a2a2a",
                             fontSize: 12,
-                            // Faint yellow highlight for leave rows (shown but excluded from calcs)
                             background: l?.isLeave ? "rgba(255, 235, 59, 0.14)" : "transparent",
                           }}
                         >
@@ -756,13 +928,23 @@ export default function PayrunsPage() {
                           <div>{hours.toFixed(2)}</div>
                           <div>{baseRate}</div>
                           <div>{mult}</div>
-                          <div style={{ fontWeight: 800 }}>{money(l.cost)}</div>
+                          <div style={{ fontWeight: 800 }}>{costText}</div>
                         </div>
                       );
                     })}
                   </div>
 
-                  <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
+                  <div style={{ marginTop: 8, fontSize: 12, opacity: 0.85 }}>
+                    Overtime total: <b>{money(emp.overtimeCost)}</b>
+                    {" · "}
+                    Extra vs ordinary: <b>{money(emp.overtimeExtraCost)}</b>
+                    {" · "}
+                    Leave (est): <b>{emp.leaveCost > 0 ? money(emp.leaveCost) : "—"}</b>
+                    {" · "}
+                    Total pay: <b>{money(empTotalPay)}</b>
+                  </div>
+
+                  <div style={{ marginTop: 6, fontSize: 12, opacity: 0.8 }}>
                     Tip: Base rate is shown from Xero Employees when available. If you want totals/costs to update, re-run{" "}
                     <b>Apply Rules</b> after syncing employees.
                   </div>
